@@ -1420,27 +1420,65 @@ export async function setChatGptThinkMode(
     }, undefined, actionOptions);
     const before = await composerState();
     if (before.text) throw new Error("ChatGPT Think selection requires an empty prompt draft");
-    await composer.focus(actionOptions);
-    await composer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, actionOptions);
-    await composer.pressSequentially("/think", { ...actionOptions, delay: 25 });
-    await captureDiagnostic?.("think-slash-triggered");
-    // The command popup shares menu-item classes with sidebar history. Count only this popup.
-    const popup = composerForm.page().locator('.popover[aria-busy="false"]').filter({ visible: true });
-    const rows = popup.locator('.__menu-item[tabindex="0"]').filter({ visible: true });
-    await rows.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
-    if (await popup.count() !== 1 || await rows.count() !== 1) {
-      throw new Error("ChatGPT Think slash menu must expose exactly one command option");
+    // The Think command trigger varies by account and UI variant ("/think" vs "@think").
+    // Try each trigger in order without matching any visible label. Only an unrecognized
+    // trigger (no option at all) falls through to the next one; an ambiguous menu or a
+    // selection failure fails closed immediately instead of guessing.
+    const thinkTriggers = ["/think", "@think"] as const;
+    const thinkPopup = composerForm.page().locator('.popover[aria-busy="false"]').filter({ visible: true });
+    const thinkRows = thinkPopup.locator('.__menu-item[tabindex="0"]').filter({ visible: true });
+    let triggerError: unknown;
+    let triggered = false;
+    for (const query of thinkTriggers) {
+      try {
+        await composer.focus(actionOptions);
+        await composer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, actionOptions);
+        await composer.pressSequentially(query, { ...actionOptions, delay: 25 });
+        await captureDiagnostic?.(query === "/think" ? "think-slash-triggered" : "think-mention-triggered");
+        // The command popup shares menu-item classes with sidebar history. Count only this popup.
+        await thinkRows.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
+        if (await thinkPopup.count() !== 1 || await thinkRows.count() !== 1) {
+          throw new Error("ChatGPT Think slash menu must expose exactly one command option");
+        }
+        const row = thinkRows.first();
+        if (await row.getAttribute("data-highlighted", actionOptions) === null) {
+          await composer.press("ArrowDown", actionOptions);
+        }
+        if (await row.getAttribute("data-highlighted", actionOptions) === null) {
+          throw new Error("ChatGPT Think slash option is not highlighted");
+        }
+        await captureDiagnostic?.(query === "/think" ? "think-slash-menu-ready" : "think-mention-menu-ready");
+        throwIfPromptAttachmentAborted(abortSignal);
+        await composer.press("Enter", actionOptions);
+        triggered = true;
+        break;
+      } catch (error) {
+        if (abortSignal?.aborted) throw error;
+        triggerError = error;
+        const recognized = await thinkRows.count().catch(() => -1);
+        // Remove exactly the typed query and prove the draft is back to its prior state
+        // before trying the next trigger. Anything else fails closed.
+        await composer.press("Escape", actionOptions);
+        const stranded = await composerState();
+        const connectorsBefore = JSON.stringify(before.connectors);
+        if (stranded.text !== before.text || JSON.stringify(stranded.connectors) !== connectorsBefore) {
+          if (!stranded.text.endsWith(query)) {
+            throw new Error("ChatGPT Think trigger cleanup did not restore the empty prompt draft");
+          }
+          await composer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, actionOptions);
+          for (let i = 0; i < query.length; i += 1) {
+            await composer.press("Shift+ArrowLeft", actionOptions);
+          }
+          await composer.press("Backspace", actionOptions);
+          const restored = await composerState();
+          if (restored.text !== before.text || JSON.stringify(restored.connectors) !== connectorsBefore) {
+            throw new Error("ChatGPT Think trigger cleanup did not restore the empty prompt draft");
+          }
+        }
+        if (recognized !== 0) throw error;
+      }
     }
-    const row = rows.first();
-    if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-      await composer.press("ArrowDown", actionOptions);
-    }
-    if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-      throw new Error("ChatGPT Think slash option is not highlighted");
-    }
-    await captureDiagnostic?.("think-slash-menu-ready");
-    throwIfPromptAttachmentAborted(abortSignal);
-    await composer.press("Enter", actionOptions);
+    if (!triggered) throw triggerError;
     const deadline = Date.now() + 5_000;
     // Accounts without a Think toggle (e.g. Go) never expose aria-pressed. The empty-draft
     // and connector checks below remain the explicit selection proof there.

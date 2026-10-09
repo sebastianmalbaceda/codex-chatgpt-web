@@ -2479,12 +2479,14 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
 
 function thinkSlashFixture() {
   const state = { pressed: false, controlPresent: true, exposeControlOnEnter: true, highlighted: true, popupCount: 1, optionCount: 1,
+    mentionOptionCount: 0, selectedChars: 0,
     draft: "", connectors: [] as string[], loseConnector: false, commands: [] as string[], enters: 0 };
   const control = { getAttribute: async () => state.pressed ? "true" : "false" };
   const controls = { count: async () => state.controlPresent ? 1 : 0, first: () => control };
   const row = { getAttribute: async () => state.highlighted ? "" : null,
-    waitFor: async () => { if (!state.optionCount) throw new Error("Think command is unavailable"); } };
-  const rows = { filter: () => rows, first: () => row, count: async () => state.optionCount };
+    waitFor: async () => { if (!(await rows.count())) throw new Error("Think command is unavailable"); } };
+  const rows = { filter: () => rows, first: () => row,
+    count: async () => state.draft.endsWith("@think") ? state.mentionOptionCount : state.optionCount };
   const popup = { filter: () => popup, locator: () => rows, count: async () => state.popupCount };
   const page = { locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : popup };
   const composer = {
@@ -2495,8 +2497,15 @@ function thinkSlashFixture() {
     pressSequentially: async (text: string) => { state.commands.push(text); state.draft += text; },
     press: async (key: string) => {
       if (key === "ArrowDown") state.highlighted = true;
+      if (key === "Shift+ArrowLeft") state.selectedChars += 1;
+      if (key === "Backspace" && state.selectedChars > 0) {
+        state.draft = state.draft.slice(0, -state.selectedChars);
+        state.selectedChars = 0;
+      }
       if (key === "Enter") {
-        if (state.draft !== "/think" || !state.highlighted) throw new Error("Unexpected composer submission");
+        if ((state.draft !== "/think" && state.draft !== "@think") || !state.highlighted) {
+          throw new Error("Unexpected composer submission");
+        }
         state.enters += 1; state.pressed = !state.pressed;
         if (state.exposeControlOnEnter) state.controlPresent = true;
         state.draft = "";
@@ -2554,6 +2563,45 @@ test("Think slash succeeds without an observable toggle and still verifies draft
   expect(ui.state.connectors).toEqual(["Codex Native2"]);
   expect(checkpoints).toContain("think-enabled");
 }, 15_000);
+
+test("Think falls back to @think when the slash trigger exposes no option", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  ui.state.optionCount = 0;
+  ui.state.mentionOptionCount = 1;
+  ui.state.connectors = ["Codex Native2"];
+  const checkpoints: string[] = [];
+  await setChatGptThinkMode(ui.composerForm as never, true, async checkpoint => { checkpoints.push(checkpoint); });
+  expect(ui.state.commands).toEqual(["/think", "@think"]);
+  expect(ui.state.enters).toBe(1);
+  expect(ui.state.draft).toBe("");
+  expect(ui.state.connectors).toEqual(["Codex Native2"]);
+  expect(checkpoints).toContain("think-mention-triggered");
+  expect(checkpoints).toContain("think-enabled");
+}, 15_000);
+
+test("Think fails closed on an ambiguous slash menu without trying @think", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.optionCount = 2;
+  ui.state.mentionOptionCount = 1;
+  await expect(setChatGptThinkMode(ui.composerForm as never, true))
+    .rejects.toThrow("exactly one command option");
+  expect(ui.state.commands).toEqual(["/think"]);
+  expect(ui.state.enters).toBe(0);
+});
+
+test("Think fails closed when neither trigger exposes an option", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.optionCount = 0;
+  ui.state.mentionOptionCount = 0;
+  await expect(setChatGptThinkMode(ui.composerForm as never, true))
+    .rejects.toThrow("Think command is unavailable");
+  expect(ui.state.commands).toEqual(["/think", "@think"]);
+  expect(ui.state.enters).toBe(0);
+  expect(ui.state.draft).toBe("");
+});
 
 test("Think attachment runs after fresh connector selection and rechecks retained and Browser-only turns", async () => {
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
