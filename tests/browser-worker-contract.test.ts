@@ -2569,7 +2569,8 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
 });
 
 function thinkSlashFixture() {
-  const state = { pressed: false, controlPresent: true, highlighted: true, popupCount: 1, optionCount: 1,
+  const state = { pressed: false, controlPresent: true, exposeControlOnEnter: true, highlighted: true, popupCount: 1, optionCount: 1,
+    formRows: 0,
     draft: "", connectors: [] as string[], loseConnector: false, commands: [] as string[], enters: 0 };
   const control = { getAttribute: async () => state.pressed ? "true" : "false",
     click: async () => { state.pressed = !state.pressed; } };
@@ -2577,6 +2578,7 @@ function thinkSlashFixture() {
   const row = { getAttribute: async () => state.highlighted ? "" : null,
     waitFor: async () => { if (!state.optionCount) throw new Error("Think command is unavailable"); } };
   const rows = { filter: () => rows, first: () => row, count: async () => state.optionCount };
+  const formRows = { filter: () => formRows, first: () => row, count: async () => state.formRows };
   const popup = { filter: () => popup, locator: () => rows, count: async () => state.popupCount };
   const page = { locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : popup };
   const composer = {
@@ -2588,13 +2590,19 @@ function thinkSlashFixture() {
     press: async (key: string) => {
       if (key === "ArrowDown") state.highlighted = true;
       if (key === "Enter") {
-        if (state.draft !== "/think" || !state.highlighted) throw new Error("Unexpected composer submission");
-        state.enters += 1; state.pressed = !state.pressed; state.controlPresent = true; state.draft = "";
+        if (state.draft !== "@think" || !state.highlighted) {
+          throw new Error("Unexpected composer submission");
+        }
+        state.enters += 1; state.pressed = !state.pressed;
+        if (state.exposeControlOnEnter) state.controlPresent = true;
+        state.draft = "";
         if (state.loseConnector) state.connectors = [];
       }
     },
   };
-  const composerForm = { getByRole: () => ({ filter: () => controls }), locator: () => composer, page: () => page };
+  const composerForm = { getByRole: () => ({ filter: () => controls }),
+    locator: (selector?: string) => typeof selector === "string" && selector.includes("__menu-item") ? formRows : composer,
+    page: () => page };
   return { state, composer, composerForm, page, control };
 }
 
@@ -2629,9 +2637,68 @@ test("Think slash requires one command and verifies a newly exposed control", as
   const unavailable = thinkSlashFixture();
   unavailable.state.controlPresent = false;
   unavailable.state.optionCount = 0;
-  await expect(setChatGptThinkMode(unavailable.composer as never, true)).rejects.toThrow("Think command is unavailable");
+  await expect(setChatGptThinkMode(unavailable.composer as never, true))
+    .rejects.toThrow("exactly one command option");
   expect(unavailable.state.enters).toBe(0);
-});
+}, 20_000);
+
+test("Think mention succeeds without an observable toggle and still verifies draft and connectors", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  ui.state.connectors = ["Codex Native2"];
+  const checkpoints: string[] = [];
+  await setChatGptThinkMode(ui.composer as never, true, async checkpoint => { checkpoints.push(checkpoint); });
+  expect(ui.state.commands).toEqual(["@think"]);
+  expect(ui.state.enters).toBe(1);
+  expect(ui.state.connectors).toEqual(["Codex Native2"]);
+  expect(checkpoints).toContain("think-enabled");
+}, 15_000);
+
+test("Think mention walks an unhighlighted single option until it can be chosen", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  ui.state.highlighted = false;
+  ui.state.connectors = ["Codex Native2"];
+  await setChatGptThinkMode(ui.composer as never, true);
+  expect(ui.state.commands).toEqual(["@think"]);
+  expect(ui.state.enters).toBe(1);
+  expect(ui.state.highlighted).toBeTrue();
+}, 15_000);
+
+test("Think fails closed on an ambiguous mention menu", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.optionCount = 2;
+  await expect(setChatGptThinkMode(ui.composer as never, true))
+    .rejects.toThrow("exactly one command option");
+  expect(ui.state.commands).toEqual(["@think"]);
+  expect(ui.state.enters).toBe(0);
+}, 15_000);
+
+test("Think fails closed when no menu scope exposes an option", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.optionCount = 0;
+  await expect(setChatGptThinkMode(ui.composer as never, true))
+    .rejects.toThrow("exactly one command option");
+  expect(ui.state.commands).toEqual(["@think"]);
+  expect(ui.state.enters).toBe(0);
+}, 15_000);
+
+test("Think finds its option in the composer form when no popover exposes it", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  ui.state.optionCount = 0;
+  ui.state.formRows = 1;
+  ui.state.connectors = ["Codex Native2"];
+  await setChatGptThinkMode(ui.composer as never, true);
+  expect(ui.state.commands).toEqual(["@think"]);
+  expect(ui.state.enters).toBe(1);
+  expect(ui.state.connectors).toEqual(["Codex Native2"]);
+}, 15_000);
 
 test("a failed Think toggle does not attempt a second action or alter the draft", async () => {
   const ui = thinkSlashFixture();
@@ -2701,6 +2768,50 @@ test("Think attachment rolls back when connector selection disables Think", asyn
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
   await expect(attach.call(worker, ui.page, "must not be inserted", true, undefined, undefined, false, undefined, true))
     .rejects.toThrow("did not preserve Think mode");
+  expect(insertions).toBe(0);
+  expect(cleanup).toBe(1);
+});
+
+test("Think attachment without a toggle proves the connector survived with an empty draft", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  let insertions = 0;
+  const worker = {
+    config: { appName: "Codex Native2" },
+    activeComposer: async () => ui.composer,
+    selectConnector: async () => { ui.state.connectors = ["Codex Native2"]; return ui.composer; },
+    connectorIsSelected: async () => true,
+    attachedPromptText: async () => "",
+    insertPromptText: async () => { insertions += 1; },
+    assertPromptAttached: async () => {},
+    clearChatGptComposerState: async () => { ui.state.draft = ""; ui.state.connectors = []; },
+  };
+  const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
+  await attach.call(worker, ui.page, "task", true, undefined, undefined, false, undefined, true);
+  expect(ui.state.pressed).toBeTrue();
+  expect(insertions).toBe(1);
+});
+
+test("Think attachment without a toggle rolls back a lost connector", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  let insertions = 0;
+  let cleanup = 0;
+  const worker = {
+    config: { appName: "Codex Native2" },
+    activeComposer: async () => ui.composer,
+    selectConnector: async () => { ui.state.connectors = ["Codex Native2"]; return ui.composer; },
+    connectorIsSelected: async () => false,
+    attachedPromptText: async () => "",
+    insertPromptText: async () => { insertions += 1; },
+    assertPromptAttached: async () => {},
+    clearChatGptComposerState: async () => { cleanup += 1; ui.state.draft = ""; ui.state.connectors = []; },
+  };
+  const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
+  await expect(attach.call(worker, ui.page, "must not be inserted", true, undefined, undefined, false, undefined, true))
+    .rejects.toThrow("did not keep");
   expect(insertions).toBe(0);
   expect(cleanup).toBe(1);
 });

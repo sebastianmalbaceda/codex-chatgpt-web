@@ -1512,41 +1512,81 @@ export async function setChatGptThinkMode(
     if (count === 1) {
       await control.click(actionOptions);
     } else {
+      // Think is invoked as a mention ("@think"), which surfaces its single option without
+      // matching any visible label. The menu container varies by UI variant, so probe each
+      // candidate scope in order; sidebar history lives in none of them. Anything unexpected
+      // fails closed instead of guessing.
       await composer.focus(actionOptions);
       await composer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, actionOptions);
-      await composer.pressSequentially("/think", { ...actionOptions, delay: 25 });
-      await captureDiagnostic?.("think-slash-triggered");
-      // The command popup shares menu-item classes with sidebar history. Count only this popup.
-      const popup = composerForm.page().locator('.popover[aria-busy="false"]').filter({ visible: true });
-      const rows = popup.locator('.__menu-item[tabindex="0"]').filter({ visible: true });
-      await rows.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
-      if (await popup.count() !== 1 || await rows.count() !== 1) {
-        throw new Error("ChatGPT Think slash menu must expose exactly one command option");
+      await composer.pressSequentially("@think", { ...actionOptions, delay: 25 });
+      await captureDiagnostic?.("think-mention-triggered");
+      const menuScopes = [
+        composerForm.page().locator(".popover"),
+        composerForm,
+      ];
+      let menuRows: Locator | undefined;
+      const scopeCounts: number[] = [];
+      for (let i = 0; i < menuScopes.length; i += 1) {
+        const candidate = menuScopes[i]!.locator('.__menu-item[tabindex="0"]').filter({ visible: true });
+        const deadline = Date.now() + 2_500;
+        for (;;) {
+          throwIfPromptAttachmentAborted(abortSignal);
+          const count = await candidate.count().catch(() => -1);
+          scopeCounts[i] = count;
+          if (count === 1) { menuRows = candidate; break; }
+          if (Date.now() >= deadline) break;
+          await withBrowserTurnAbort(new Promise(resolveSleep => setTimeout(resolveSleep, 100)), abortSignal);
+        }
+        if (menuRows) break;
       }
-      const row = rows.first();
-      if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-        await composer.press("ArrowDown", actionOptions);
+      if (!menuRows) {
+        throw new Error(
+          `ChatGPT Think menu must expose exactly one command option (visibleRowsByScope=[${scopeCounts.join(",")}])`,
+        );
       }
-      if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-        throw new Error("ChatGPT Think slash option is not highlighted");
+      // The mention menu does not always highlight its single option up front: walk it
+      // until the highlight lands, mirroring connector selection.
+      const row = menuRows.first();
+      const rowHighlighted = async () => await row.getAttribute("data-highlighted", actionOptions) !== null;
+      if (!await rowHighlighted()) {
+        const highlightDeadline = Date.now() + 3_000;
+        while (Date.now() < highlightDeadline && !await rowHighlighted()) {
+          throwIfPromptAttachmentAborted(abortSignal);
+          await composer.press("ArrowDown", actionOptions);
+        }
       }
-      await captureDiagnostic?.("think-slash-menu-ready");
+      if (!await rowHighlighted()) {
+        throw new Error("ChatGPT Think option is not highlighted");
+      }
+      await captureDiagnostic?.("think-mention-menu-ready");
       throwIfPromptAttachmentAborted(abortSignal);
       await composer.press("Enter", actionOptions);
     }
     const deadline = Date.now() + 5_000;
+    // Accounts without a Think toggle (e.g. Go) never expose aria-pressed. The empty-draft
+    // and connector checks below remain the explicit selection proof there.
+    const enteredAt = Date.now();
+    let toggleObserved = count === 1;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
       const currentCount = await controls.count();
       if (currentCount > 1) throw new Error(`ChatGPT exposed ${currentCount} visible Think controls`);
-      pressed = currentCount === 1 ? await control.getAttribute("aria-pressed", actionOptions) : null;
-      if (pressed === target) break;
-      if (currentCount === 1 && pressed !== "true" && pressed !== "false") {
-        throw new Error("ChatGPT Think control lost its semantic pressed state");
+      if (currentCount === 1) {
+        toggleObserved = true;
+        pressed = await control.getAttribute("aria-pressed", actionOptions);
+        if (pressed === target) break;
+        if (pressed !== "true" && pressed !== "false") {
+          throw new Error("ChatGPT Think control lost its semantic pressed state");
+        }
+      } else if (!toggleObserved && Date.now() - enteredAt >= 500) {
+        // No toggle to observe: once the draft is back to empty with connectors preserved,
+        // selection is committed without waiting out the full deadline.
+        const draft = await composerState();
+        if (!draft.text && JSON.stringify(draft.connectors) === JSON.stringify(before.connectors)) break;
       }
       await withBrowserTurnAbort(new Promise(resolveSleep => setTimeout(resolveSleep, 100)), abortSignal);
     }
-    if (pressed !== target) {
+    if (toggleObserved && pressed !== target) {
       throw new Error(`ChatGPT did not ${enabled ? "enable" : "disable"} Think mode`);
     }
     const after = await composerState();
@@ -3748,7 +3788,19 @@ export class ChatGptBrowserWorker {
       if (requireThink) {
         const controls = selectedComposer.locator("xpath=ancestor::form[1]")
           .getByRole("button", { name: "Think", exact: true }).filter({ visible: true });
-        if (await controls.count() !== 1 || await controls.first().getAttribute("aria-pressed", {
+        const thinkCount = await controls.count();
+        if (thinkCount === 0) {
+          // Accounts without a Think toggle cannot prove Think mode through aria-pressed.
+          // Prove the connector reference survived with an empty draft instead; the committed
+          // single-option command selection above remains the Think evidence. Anything else
+          // fails closed rather than sending as plain Luna.
+          if (!await this.connectorIsSelected(selectedComposer, abortSignal)) {
+            throw new Error(`ChatGPT composer did not keep ${JSON.stringify(this.config.appName)} connector selected after Think selection`);
+          }
+          if (await this.attachedPromptText(page, abortSignal)) {
+            throw new Error("ChatGPT composer did not preserve the empty prompt draft after Think selection");
+          }
+        } else if (thinkCount !== 1 || await controls.first().getAttribute("aria-pressed", {
           signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
         }) !== "true") {
           throw new Error("ChatGPT connector selection did not preserve Think mode");
