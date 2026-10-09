@@ -2478,7 +2478,7 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
 });
 
 function thinkSlashFixture() {
-  const state = { pressed: false, controlPresent: true, highlighted: true, popupCount: 1, optionCount: 1,
+  const state = { pressed: false, controlPresent: true, exposeControlOnEnter: true, highlighted: true, popupCount: 1, optionCount: 1,
     draft: "", connectors: [] as string[], loseConnector: false, commands: [] as string[], enters: 0 };
   const control = { getAttribute: async () => state.pressed ? "true" : "false" };
   const controls = { count: async () => state.controlPresent ? 1 : 0, first: () => control };
@@ -2497,7 +2497,9 @@ function thinkSlashFixture() {
       if (key === "ArrowDown") state.highlighted = true;
       if (key === "Enter") {
         if (state.draft !== "/think" || !state.highlighted) throw new Error("Unexpected composer submission");
-        state.enters += 1; state.pressed = !state.pressed; state.controlPresent = true; state.draft = "";
+        state.enters += 1; state.pressed = !state.pressed;
+        if (state.exposeControlOnEnter) state.controlPresent = true;
+        state.draft = "";
         if (state.loseConnector) state.connectors = [];
       }
     },
@@ -2539,6 +2541,19 @@ test("Think slash requires one command and verifies a newly exposed control", as
   await expect(setChatGptThinkMode(unavailable.composerForm as never, true)).rejects.toThrow("Think command is unavailable");
   expect(unavailable.state.enters).toBe(0);
 });
+
+test("Think slash succeeds without an observable toggle and still verifies draft and connectors", async () => {
+  const ui = thinkSlashFixture();
+  ui.state.controlPresent = false;
+  ui.state.exposeControlOnEnter = false;
+  ui.state.connectors = ["Codex Native2"];
+  const checkpoints: string[] = [];
+  await setChatGptThinkMode(ui.composerForm as never, true, async checkpoint => { checkpoints.push(checkpoint); });
+  expect(ui.state.commands).toEqual(["/think"]);
+  expect(ui.state.enters).toBe(1);
+  expect(ui.state.connectors).toEqual(["Codex Native2"]);
+  expect(checkpoints).toContain("think-enabled");
+}, 15_000);
 
 test("Think attachment runs after fresh connector selection and rechecks retained and Browser-only turns", async () => {
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;

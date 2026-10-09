@@ -1442,18 +1442,30 @@ export async function setChatGptThinkMode(
     throwIfPromptAttachmentAborted(abortSignal);
     await composer.press("Enter", actionOptions);
     const deadline = Date.now() + 5_000;
+    // Accounts without a Think toggle (e.g. Go) never expose aria-pressed. The empty-draft
+    // and connector checks below remain the explicit selection proof there.
+    const enteredAt = Date.now();
+    let toggleObserved = count === 1;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
       const currentCount = await controls.count();
       if (currentCount > 1) throw new Error(`ChatGPT exposed ${currentCount} visible Think controls`);
-      pressed = currentCount === 1 ? await control.getAttribute("aria-pressed", actionOptions) : null;
-      if (pressed === target) break;
-      if (currentCount === 1 && pressed !== "true" && pressed !== "false") {
-        throw new Error("ChatGPT Think control lost its semantic pressed state");
+      if (currentCount === 1) {
+        toggleObserved = true;
+        pressed = await control.getAttribute("aria-pressed", actionOptions);
+        if (pressed === target) break;
+        if (pressed !== "true" && pressed !== "false") {
+          throw new Error("ChatGPT Think control lost its semantic pressed state");
+        }
+      } else if (!toggleObserved && Date.now() - enteredAt >= 500) {
+        // No toggle to observe: once the draft is back to empty with connectors preserved,
+        // selection is committed without waiting out the full deadline.
+        const draft = await composerState();
+        if (!draft.text && JSON.stringify(draft.connectors) === JSON.stringify(before.connectors)) break;
       }
       await withBrowserTurnAbort(new Promise(resolveSleep => setTimeout(resolveSleep, 100)), abortSignal);
     }
-    if (pressed !== target) {
+    if (toggleObserved && pressed !== target) {
       throw new Error(`ChatGPT did not ${enabled ? "enable" : "disable"} Think mode`);
     }
     const after = await composerState();
